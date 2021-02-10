@@ -1,13 +1,25 @@
 use std::net::UdpSocket;
 
+use undaunted::network::packets::*;
+
 fn main() {
     let socket = UdpSocket::bind("0.0.0.0:0").expect("Failed to bind socket");
 
-    let hello_bytes = "hello".as_bytes();
+    loop {
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_line(&mut buffer)
+            .expect("Failed to get buffer?");
 
-    socket
-        .send_to(hello_bytes, "127.0.0.1:1337")
-        .expect("Failed to send data");
+        let packet = Packet::new(1, PacketData::Talk(TalkData::new(buffer)));
+        dbg!(&packet);
 
-    println!("Sent {:#?} to the server", hello_bytes);
+        let bytes = rmp_serde::to_vec(&packet).expect("Failed to serialize");
+
+        socket
+            .send_to(&bytes, "127.0.0.1:1337")
+            .expect("Failed to send data");
+
+        println!("Sent {:#?} to the server", bytes);
+    }
 }
