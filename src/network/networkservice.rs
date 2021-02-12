@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use super::packets::{Packet, PacketData};
 
@@ -9,7 +9,7 @@ pub struct AddressPacket {
     pub address: SocketAddr,
 }
 
-pub trait SocketWrapper {
+pub trait Socket : Send + Sync {
     fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize>;
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)>;
 }
@@ -21,6 +21,7 @@ impl AddressPacket {
 }
 
 pub trait NetworkService {
-    fn get_packets(&mut self) -> Vec<AddressPacket>;
-    fn queue_for_send(&mut self, packet_data: PacketData, to_addr: SocketAddr);
+    fn start(self: &Arc<Self>);
+    fn get_packets(self: &Arc<Self>) -> Vec<AddressPacket>;
+    fn queue_for_send(self: &Arc<Self>, packet_data: PacketData, to_addr: SocketAddr);
 }
