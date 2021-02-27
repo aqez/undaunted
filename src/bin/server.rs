@@ -1,6 +1,6 @@
-use std::net::UdpSocket;
+use std::{net::UdpSocket, time::Duration};
 
-use undaunted::network::{packets::*, NetworkService, UdpNetworkService};
+use undaunted::network::{NetworkService, UdpNetworkService};
 
 fn main() {
     let socket = UdpSocket::bind("127.0.0.1:1337").expect("Failed to bind socket");
@@ -12,7 +12,9 @@ fn main() {
     loop {
         let packets = network_service.get_packets();
 
-        dbg!(packets);
-        std::thread::sleep_ms(500);
+        if packets.len() > 0 {
+            dbg!(packets);
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }

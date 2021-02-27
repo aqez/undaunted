@@ -15,7 +15,7 @@ impl Packet {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PacketData {
     Talk(TalkData),
-    Ack(i32),
+    Ack(u32),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

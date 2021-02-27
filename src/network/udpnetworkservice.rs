@@ -1,45 +1,64 @@
 use std::{
+    collections::HashMap,
     net::{SocketAddr, UdpSocket},
     sync::{Arc, Mutex},
+    time::Duration,
 };
+
+use chrono::{DateTime, Utc};
 
 use super::{
     packets::{Packet, PacketData},
     AddressPacket, NetworkService, Socket,
 };
 
+struct SentPacket {
+    address_packet: AddressPacket,
+    sent_time: DateTime<Utc>,
+}
+
+impl SentPacket {
+    fn new(address_packet: AddressPacket, sent_time: DateTime<Utc>) -> SentPacket {
+        SentPacket { address_packet, sent_time }
+    }
+}
+
 pub struct UdpNetworkService<TSocket: Socket> {
     socket: TSocket,
     received_packets: Mutex<Vec<AddressPacket>>,
     to_send: Mutex<Vec<AddressPacket>>,
+    unacked_packets: Mutex<Vec<SentPacket>>,
+    packet_ids: Mutex<HashMap<SocketAddr, u32>>,
 }
 
-impl<TSocket: Socket> UdpNetworkService<TSocket> {
+impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
     pub fn new(socket: TSocket) -> Arc<Self> {
         Arc::new(Self {
             socket,
             received_packets: Mutex::new(Vec::new()),
             to_send: Mutex::new(Vec::new()),
+            unacked_packets: Mutex::new(Vec::new()),
+            packet_ids: Mutex::new(HashMap::new()),
         })
     }
 
     fn send_packets(self: &Arc<Self>) {
         let copy = {
             let mut to_send = self.to_send.lock().unwrap();
-            println!("Copying {} packets", to_send.len());
-
             let copy = to_send.to_vec();
             to_send.clear();
-
             copy
         };
 
-        for ap in copy.iter() {
+        let mut unacked = self.unacked_packets.lock().unwrap();
+        for ap in copy.into_iter() {
             let bytes = rmp_serde::to_vec(&ap.packet).expect("Failed to serialize");
             println!("Trying to send {} bytes to {:?}", bytes.len(), ap.address);
             self.socket
                 .send_to(&bytes, ap.address)
                 .expect("Failed to send data");
+
+            unacked.push(SentPacket::new(ap, Utc::now()));
         }
     }
 
@@ -52,6 +71,13 @@ impl<TSocket: Socket> UdpNetworkService<TSocket> {
 
         let packet: Packet =
             rmp_serde::from_read_ref(&buffer[0..size]).expect("Failed to deserialize");
+
+        match packet.packet_data {
+            PacketData::Ack(_) => {}
+            _ => {
+                self.queue_for_send(PacketData::Ack(packet.id), address);
+            }
+        }
 
         let address_packet = AddressPacket::new(packet, address);
         let mut received = self.received_packets.lock().unwrap();
@@ -72,7 +98,13 @@ impl<TSocket: Socket + 'static> NetworkService for UdpNetworkService<TSocket> {
     }
 
     fn queue_for_send(self: &Arc<Self>, packet_data: PacketData, to_addr: SocketAddr) {
-        let packet = Packet::new(1, packet_data);
+        let mut ids = self.packet_ids.lock().unwrap();
+
+        let id = ids.entry(to_addr).or_insert(0);
+        let packet = Packet::new(*id, packet_data);
+
+        *id += 1;
+
         let address_packet = AddressPacket::new(packet, to_addr);
         self.to_send.lock().unwrap().push(address_packet);
     }
@@ -82,7 +114,7 @@ impl<TSocket: Socket + 'static> NetworkService for UdpNetworkService<TSocket> {
             let clone = Arc::clone(self);
             move || loop {
                 clone.receive_packets();
-                std::thread::sleep_ms(500);
+                std::thread::sleep(Duration::from_millis(500));
             }
         });
 
@@ -90,7 +122,7 @@ impl<TSocket: Socket + 'static> NetworkService for UdpNetworkService<TSocket> {
             let clone = Arc::clone(self);
             move || loop {
                 clone.send_packets();
-                std::thread::sleep_ms(500);
+                std::thread::sleep(Duration::from_millis(500));
             }
         });
     }
@@ -109,16 +141,60 @@ impl Socket for UdpSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::packets::*;
 
     struct NullSocket;
     impl Socket for NullSocket {
-        fn send_to(&self, buf: &[u8], addr: SocketAddr) -> std::io::Result<usize> {
-            todo!()
+        fn send_to(&self, buf: &[u8], _addr: SocketAddr) -> std::io::Result<usize> {
+            Ok(buf.len())
         }
 
-        fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-            todo!()
+        fn recv_from(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            Ok((0, "127.0.0.1:0".parse().unwrap()))
         }
+    }
+
+
+    #[test]
+    fn queue_for_send_adds_incremented_packet_ids_for_same_client_to_send_list() {
+        let network = UdpNetworkService::new(NullSocket {});
+        let to_addr = "127.0.0.1:0".parse().unwrap();
+        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), to_addr);
+        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), to_addr);
+
+        let to_send = network.to_send.lock().unwrap();
+
+        assert_eq!(0, to_send[0].packet.id);
+        assert_eq!(1, to_send[1].packet.id);
+    }
+
+    #[test]
+    fn queue_for_send_doesnt_increment_for_different_client_ids() {
+        let network = UdpNetworkService::new(NullSocket {});
+        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:10".parse().unwrap());
+        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:11".parse().unwrap());
+        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:10".parse().unwrap());
+        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:11".parse().unwrap());
+
+        let to_send = network.to_send.lock().unwrap();
+
+        assert_eq!(0, to_send[0].packet.id);
+        assert_eq!(0, to_send[1].packet.id);
+        assert_eq!(1, to_send[2].packet.id);
+        assert_eq!(1, to_send[3].packet.id);
+    }
+
+
+    #[test]
+    fn send_packets_adds_sent_packets_to_unacked_list() {
+        let network = UdpNetworkService::new(NullSocket {});
+        network.queue_for_send(PacketData::Ack(1), "127.0.0.1:0".parse().unwrap());
+
+        network.send_packets();
+
+        assert_eq!(0, network.to_send.lock().unwrap().len());
+        assert_eq!(1, network.unacked_packets.lock().unwrap().len());
+
     }
 
     #[test]
@@ -147,7 +223,7 @@ mod tests {
 
     #[test]
     fn get_packets_clears_old_packets() {
-        let mut network = UdpNetworkService::new(NullSocket {});
+        let network = UdpNetworkService::new(NullSocket {});
         {
             let mut received = network.received_packets.lock().unwrap();
             received.push(AddressPacket::new(
