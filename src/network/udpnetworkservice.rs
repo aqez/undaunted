@@ -19,7 +19,10 @@ struct SentPacket {
 
 impl SentPacket {
     fn new(address_packet: AddressPacket, sent_time: DateTime<Utc>) -> SentPacket {
-        SentPacket { address_packet, sent_time }
+        SentPacket {
+            address_packet,
+            sent_time,
+        }
     }
 }
 
@@ -58,7 +61,10 @@ impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
                 .send_to(&bytes, ap.address)
                 .expect("Failed to send data");
 
-            unacked.push(SentPacket::new(ap, Utc::now()));
+            match ap.packet.packet_data {
+                PacketData::Ack(_) => {}
+                _ => unacked.push(SentPacket::new(ap, Utc::now())),
+            }
         }
     }
 
@@ -73,7 +79,10 @@ impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
             rmp_serde::from_read_ref(&buffer[0..size]).expect("Failed to deserialize");
 
         match packet.packet_data {
-            PacketData::Ack(_) => {}
+            PacketData::Ack(_) => {
+                self.remove_unacked_packet(packet.id, address);
+                return;
+            }
             _ => {
                 self.queue_for_send(PacketData::Ack(packet.id), address);
             }
@@ -82,6 +91,37 @@ impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
         let address_packet = AddressPacket::new(packet, address);
         let mut received = self.received_packets.lock().unwrap();
         received.push(address_packet);
+    }
+
+    fn remove_unacked_packet(self: &Arc<Self>, id: u32, address: SocketAddr) {
+        let mut i = 0;
+        let mut unacked = self.unacked_packets.lock().unwrap();
+
+        while i != unacked.len() {
+            if unacked[i].address_packet.packet.id == id
+                && unacked[i].address_packet.address == address
+            {
+                unacked.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn requeue_unacked_packets(self: &Arc<Self>) {
+        let max_age = chrono::Duration::milliseconds(1000);
+        let now = Utc::now();
+        let mut to_send = self.to_send.lock().unwrap();
+        let mut unacked = self.unacked_packets.lock().unwrap();
+
+        let mut i = 0;
+        while i != unacked.len() {
+            if (now - unacked[i].sent_time) > max_age {
+                to_send.push(unacked.remove(i).address_packet);
+            } else {
+                i += 1;
+            }
+        }
     }
 }
 
@@ -114,15 +154,16 @@ impl<TSocket: Socket + 'static> NetworkService for UdpNetworkService<TSocket> {
             let clone = Arc::clone(self);
             move || loop {
                 clone.receive_packets();
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(5));
             }
         });
 
         std::thread::spawn({
             let clone = Arc::clone(self);
             move || loop {
+                clone.requeue_unacked_packets();
                 clone.send_packets();
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(5));
             }
         });
     }
@@ -154,7 +195,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn queue_for_send_adds_incremented_packet_ids_for_same_client_to_send_list() {
         let network = UdpNetworkService::new(NullSocket {});
@@ -171,10 +211,22 @@ mod tests {
     #[test]
     fn queue_for_send_doesnt_increment_for_different_client_ids() {
         let network = UdpNetworkService::new(NullSocket {});
-        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:10".parse().unwrap());
-        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:11".parse().unwrap());
-        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:10".parse().unwrap());
-        network.queue_for_send(PacketData::Talk(TalkData::new("ha".to_string())), "127.0.0.1:11".parse().unwrap());
+        network.queue_for_send(
+            PacketData::Talk(TalkData::new("ha".to_string())),
+            "127.0.0.1:10".parse().unwrap(),
+        );
+        network.queue_for_send(
+            PacketData::Talk(TalkData::new("ha".to_string())),
+            "127.0.0.1:11".parse().unwrap(),
+        );
+        network.queue_for_send(
+            PacketData::Talk(TalkData::new("ha".to_string())),
+            "127.0.0.1:10".parse().unwrap(),
+        );
+        network.queue_for_send(
+            PacketData::Talk(TalkData::new("ha".to_string())),
+            "127.0.0.1:11".parse().unwrap(),
+        );
 
         let to_send = network.to_send.lock().unwrap();
 
@@ -183,7 +235,6 @@ mod tests {
         assert_eq!(1, to_send[2].packet.id);
         assert_eq!(1, to_send[3].packet.id);
     }
-
 
     #[test]
     fn send_packets_adds_sent_packets_to_unacked_list() {
@@ -194,7 +245,6 @@ mod tests {
 
         assert_eq!(0, network.to_send.lock().unwrap().len());
         assert_eq!(1, network.unacked_packets.lock().unwrap().len());
-
     }
 
     #[test]
