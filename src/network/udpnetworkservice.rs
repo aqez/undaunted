@@ -32,6 +32,7 @@ pub struct UdpNetworkService<TSocket: Socket> {
     to_send: Mutex<Vec<AddressPacket>>,
     unacked_packets: Mutex<Vec<SentPacket>>,
     packet_ids: Mutex<HashMap<SocketAddr, u32>>,
+    connections: Mutex<HashMap<SocketAddr, DateTime<Utc>>>,
 }
 
 impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
@@ -42,6 +43,7 @@ impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
             to_send: Mutex::new(Vec::new()),
             unacked_packets: Mutex::new(Vec::new()),
             packet_ids: Mutex::new(HashMap::new()),
+            connections: Mutex::new(HashMap::new()),
         })
     }
 
@@ -78,6 +80,8 @@ impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
         let packet: Packet =
             rmp_serde::from_read_ref(&buffer[0..size]).expect("Failed to deserialize");
 
+        self.update_connection_time(address);
+
         match packet.packet_data {
             PacketData::Ack(_) => {
                 self.remove_unacked_packet(packet.id, address);
@@ -91,6 +95,12 @@ impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
         let address_packet = AddressPacket::new(packet, address);
         let mut received = self.received_packets.lock().unwrap();
         received.push(address_packet);
+    }
+
+    fn update_connection_time(self: &Arc<Self>, address: SocketAddr) {
+        let mut connections = self.connections.lock().unwrap();
+        let last_packet_time = connections.entry(address).or_insert(Utc::now());
+        *last_packet_time = Utc::now();
     }
 
     fn remove_unacked_packet(self: &Arc<Self>, id: u32, address: SocketAddr) {
@@ -120,6 +130,29 @@ impl<TSocket: Socket + 'static> UdpNetworkService<TSocket> {
                 to_send.push(unacked.remove(i).address_packet);
             } else {
                 i += 1;
+            }
+        }
+    }
+
+    fn handle_disconnected_clients(self: &Arc<Self>) {
+        let max_age = chrono::Duration::milliseconds(5000);
+        let now = Utc::now();
+
+        let mut to_send = self.to_send.lock().unwrap();
+        let mut unacked = self.unacked_packets.lock().unwrap();
+        let mut connections = self.connections.lock().unwrap();
+
+        let addresses: Vec<SocketAddr> = connections.keys().cloned().collect();
+
+        for address in addresses {
+            let last_packet_time = connections.get(&address).unwrap();
+
+            if now - *last_packet_time > max_age {
+                println!("Disconnecting {:?} and removing his packets!", address);
+                connections.remove(&address);
+
+                to_send.retain(|ap| ap.address != address);
+                unacked.retain(|sp| sp.address_packet.address != address);
             }
         }
     }
@@ -161,6 +194,7 @@ impl<TSocket: Socket + 'static> NetworkService for UdpNetworkService<TSocket> {
         std::thread::spawn({
             let clone = Arc::clone(self);
             move || loop {
+                clone.handle_disconnected_clients();
                 clone.requeue_unacked_packets();
                 clone.send_packets();
                 std::thread::sleep(Duration::from_millis(5));
